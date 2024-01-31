@@ -8,6 +8,7 @@ type value = VInt of int
             | VClosure of string * (string * value) list * expr * string option
             | VUser of string * value list
             | VConstructor of string
+            | VBuiltin of string
 
 type env = (string * value) list
 
@@ -116,6 +117,7 @@ let rec string_of_value (v : value) : string =
         | Some id1 -> "<" ^ id ^ ", " ^ string_of_expr func ^ ", " ^ id1 ^ ">")
     | VUser (id, vs) -> id ^ "(" ^ String.concat ", " (List.map string_of_value vs) ^ ")"
     | VConstructor id -> id
+    | VBuiltin id -> id
 
 let rec print_env (env : env) : unit =
     match env with
@@ -231,6 +233,17 @@ let rec eval_expr (expr : expr) (eval_env : env) : value =
         | VConstructor (id) -> (match arg_val with
                                     | VTuple (vs) -> VUser (id, vs)
                                     | _ ->VUser (id, [arg_val]))
+        | VBuiltin (id) -> (match id with
+                                | "print_string" -> print_string (match arg_val with
+                                                                    | VString s -> s
+                                                                    | _ -> failwith "print_string requires a string"); VUnit
+                                | "string_of_int" -> (match arg_val with
+                                                        | VInt i -> VString (string_of_int i)
+                                                        | _ -> failwith "string_of_int requires an integer")
+                                | "int_of_string" -> (match arg_val with
+                                                        | VString s -> VInt (int_of_string s)
+                                                        | _ -> failwith "int_of_string requires a string")
+                                | _ -> failwith "It is not a builtin function")
         (* Functions for print_string, string_of_int, int_of_string *)
         | _ -> failwith "Function call requires a function")
 
@@ -380,16 +393,16 @@ let interpret_binding (binding : binding) (eval_env : env) : env =
         new_env
 
 let initial_env : env = [
-    "print_string", VClosure ("s", [], Function ([SimpleParam "s"], None, FunCall (Identifier "print_string", Identifier "s")), None);
-    "string_of_int", VClosure ("i", [], Function ([SimpleParam "i"], None, FunCall (Identifier "string_of_int", Identifier "i")), None);
-    "string_of_bool", VClosure ("b", [], Function ([SimpleParam "b"], None, FunCall (Identifier "string_of_bool", Identifier "b")), None);
+    ("print_string", VBuiltin "print_string");
+    ("string_of_int", VBuiltin "string_of_int");
+    ("int_of_string", VBuiltin "int_of_string")
 ]
 
 (* Main entry point *)
 let interpret_program (p : program): unit = 
     let rec helper (eval_env : env) (p : program) : unit =
         match p with
-        | [] -> print_env eval_env; ()
+        | [] -> print_endline "Interpreter Environment:"; print_env eval_env; ()
         | binding :: bindings -> let new_env = interpret_binding binding eval_env in
                                 helper new_env bindings 
     in

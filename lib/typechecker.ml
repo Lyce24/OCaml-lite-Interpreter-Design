@@ -132,29 +132,40 @@ let rec occurs_check var ty =
   | _ -> false
 
 let substitute_in_environment env var ty =
-      let new_env = StringMap.map (substitute (StringMap.singleton var ty)) env in
-      print_endline "Environment after substitution: ";
-      print_env new_env;
-      new_env
+    let temp_env = StringMap.add var ty env in
+    let new_env = StringMap.map (substitute (StringMap.singleton var ty)) temp_env in
+    new_env
 
 let rec unify (env: type_env ref) (ty1: type_expr) (ty2: type_expr) : unit =
-      match (ty1, ty2) with
-      | (IntTy, IntTy) | (StringTy, StringTy) | (BoolTy, BoolTy) | (UnitTy, UnitTy) -> ()
-      | (FuncTy (arg1, ret1), FuncTy (arg2, ret2)) ->
-          unify env arg1 arg2;
-          unify env ret1 ret2
-      | (TupleTy tys1, TupleTy tys2) ->
-          if List.length tys1 <> List.length tys2 then
-            raise (UnificationFailure "Tuples have different lengths")
-          else
-            List.iter2 (unify env) tys1 tys2
-      | (UserTy name1, UserTy name2) when name1 = name2 -> ()
-      | (VarTy var, ty) | (ty, VarTy var) ->
-          if occurs_check var ty then
-            raise (UnificationFailure ("Recursive unification " ^ var))
-          else
-            env := substitute_in_environment !env var ty;
-      | _ -> if ty1 <> ty2 then raise (UnificationFailure "Type mismatch in unification")
+    match (ty1, ty2) with
+    | (IntTy, IntTy) | (StringTy, StringTy) | (BoolTy, BoolTy) | (UnitTy, UnitTy) -> ()
+
+    | (FuncTy (arg1, ret1), FuncTy (arg2, ret2)) ->
+        unify env arg1 arg2;
+        (match (ret1, ret2) with
+        | (VarTy var1, VarTy var2) ->
+          let new_ret1 = try StringMap.find var1 !env with Not_found -> VarTy var1 in
+          let new_ret2 = try StringMap.find var2 !env with Not_found -> VarTy var2 in
+          unify env new_ret1 new_ret2
+        | _ -> unify env ret1 ret2)
+
+    | (TupleTy tys1, TupleTy tys2) ->
+        if List.length tys1 <> List.length tys2 then
+          raise (UnificationFailure "Tuples have different lengths")
+        else
+          List.iter2 (unify env) tys1 tys2
+    | (UserTy name1, UserTy name2) when name1 = name2 -> ()
+
+    | (VarTy var, ty) | (ty, VarTy var) ->
+        if occurs_check var ty then
+          raise (UnificationFailure ("Recursive unification " ^ var))
+        else
+          env := substitute_in_environment !env var ty;
+
+    | (ForallTy (var, ty1), ty2) | (ty2, ForallTy (var, ty1)) ->
+       let new_type = instantiate (ForallTy (var, ty1)) in
+        unify env new_type ty2
+    | _ -> if ty1 <> ty2 then raise (UnificationFailure "Type mismatch in unification")
 
 (* Type inference *)
 let rec infer_type (env_ref: type_env ref) (expr: expr) : type_expr =
@@ -195,6 +206,7 @@ let rec infer_type (env_ref: type_env ref) (expr: expr) : type_expr =
       TupleTy (t :: ts)
 
   | LetFun (id, params_opt, ret_type_opt, body, in_expr) ->
+      let original_env = !env_ref in 
       let update_param_types_option (env : type_env) (params: param list option) : type_env =
         match params with
         | None -> env
@@ -227,10 +239,9 @@ let rec infer_type (env_ref: type_env ref) (expr: expr) : type_expr =
               | SimpleParam type_id -> StringMap.find type_id !env_ref
               | TypedParam (type_id, _) -> StringMap.find type_id !env_ref) params in
             List.fold_right (fun param_type acc -> FuncTy (param_type, acc)) param_types (StringMap.find id !env_ref) in
-      
-      let env_with_fun = StringMap.add id fun_type !env_ref in     
-      let generalized_fun_type = generalize env_with_fun fun_type in
-      let env_with_generalized_fun = StringMap.add id generalized_fun_type env_with_fun in
+       
+      let generalized_fun_type = generalize original_env fun_type in
+      let env_with_generalized_fun = StringMap.add id generalized_fun_type original_env in
       infer_type (ref env_with_generalized_fun) in_expr
   
   | LetRec (id, params_opt, ret_type_opt, body, in_expr) ->
@@ -249,6 +260,7 @@ let rec infer_type (env_ref: type_env ref) (expr: expr) : type_expr =
                 let env = StringMap.add id (convert_type t) env in
                 helper env params in
         helper env params in
+
       let new_env = update_param_types_option !env_ref params_opt in
       let inferred_ret_type = match ret_type_opt with
         | Some t -> convert_type t
@@ -273,14 +285,17 @@ let rec infer_type (env_ref: type_env ref) (expr: expr) : type_expr =
       let env_with_generalized_fun = StringMap.add id generalized_fun_type !env_ref in
       infer_type (ref env_with_generalized_fun) in_expr
   
+  (* Type inference for function calls *)
   | FunCall (func_expr, arg_expr) ->
       let func_type = infer_type env_ref func_expr in
       let arg_type = infer_type env_ref arg_expr in
-      (match instantiate func_type with
-       | FuncTy (param_type, return_type) ->
-          unify env_ref param_type arg_type;
-          return_type
-       | _ -> raise (TypeError "Attempted to call a non-function value"))
+      let return_type = VarTy (fresh_var ()) in
+      let temp_var = fresh_var () in
+      let new_env = StringMap.add temp_var return_type !env_ref in
+      let env_ref = ref new_env in
+      unify env_ref func_type (FuncTy (arg_type, return_type));
+      (try StringMap.find temp_var !env_ref with Not_found -> failwith "Cannot apply a non-function." )
+
 
   | Function (params, ret_type_opt, body) ->
        (* Create a new environment for the function scope *)
@@ -319,6 +334,7 @@ let rec infer_type (env_ref: type_env ref) (expr: expr) : type_expr =
 
   (* For each branch, construct as a function call *)
   | MatchWith (match_expr, branches) ->
+    
     let match_type = infer_type env_ref match_expr in
     match branches with
     | [] -> raise (TypeError "Match expression must have at least one branch")
@@ -337,11 +353,12 @@ let rec infer_type (env_ref: type_env ref) (expr: expr) : type_expr =
                 let env_ref = ref temp_env in
                 let var_type = let func_type = constructor_type in
                   let arg_type = infer_type env_ref (Identifier id) in
-                  (match instantiate func_type with
-                  | FuncTy (param_type, return_type) ->
-                      unify env_ref param_type arg_type;
-                      return_type
-                  | _ -> raise (TypeError "Attempted to call a non-function value")) in
+                  let return_type = VarTy (fresh_var ()) in
+                  let temp_var = fresh_var () in
+                  let new_env = StringMap.add temp_var return_type !env_ref in
+                  let env_ref = ref new_env in
+                  unify env_ref func_type (FuncTy (arg_type, return_type));
+                  (try StringMap.find temp_var !env_ref with Not_found -> failwith "Cannot apply a non-function." ) in
                 unify env_ref match_type var_type;
                 let return_type = infer_type env_ref expr in
                 return_type
@@ -352,12 +369,12 @@ let rec infer_type (env_ref: type_env ref) (expr: expr) : type_expr =
                 let env_ref = ref temp_env in
                 let var_type = let func_type = constructor_type in
                 let arg_type = infer_type env_ref (TupleExpr (Identifier var, List.map (fun v -> Identifier v) vars)) in
-                  (match instantiate func_type with
-                  | FuncTy (param_type, return_type) ->
-                      print_endline "BUG!";
-                      unify env_ref param_type arg_type;
-                      return_type
-                  | _ -> raise (TypeError "Attempted to call a non-function value")) in
+                let return_type = VarTy (fresh_var ()) in
+                let temp_var = fresh_var () in
+                let new_env = StringMap.add temp_var return_type !env_ref in
+                let env_ref = ref new_env in
+                unify env_ref func_type (FuncTy (arg_type, return_type));
+                (try StringMap.find temp_var !env_ref with Not_found -> failwith "Cannot apply a non-function.") in
                 unify env_ref match_type var_type;
                 let return_type = infer_type env_ref expr in
                 return_type
@@ -377,7 +394,6 @@ let type_declaration (env: type_env) (type_def: type_decl) (decl_name : identifi
           | None -> StringMap.add (id) (UserTy decl_name) env
           | Some t -> StringMap.add (id) (FuncTy((convert_type t), UserTy decl_name)) env
 
-(* Main entry point *)
 let typecheck_binding (b : binding) (env : type_env) : type_env = 
     match b with
     | LetBinding (id, params_opt, ret_type_opt, expr) ->
@@ -398,14 +414,13 @@ let typecheck_binding (b : binding) (env : type_env) : type_env =
                 let env = StringMap.add id (convert_type t) env in
                 helper env params in
         helper env params in
-      let new_env = update_param_types_option !env_ref params_opt in        
+      let new_env = update_param_types_option !env_ref params_opt in   
       let inferred_ret_type = match ret_type_opt with
         | Some t -> convert_type t
         | None -> VarTy (fresh_var ()) in
 
       let new_env = StringMap.add id inferred_ret_type new_env in
       let env_ref = ref new_env in
-      let _ = infer_type env_ref expr in
       let inferred_body_type = infer_type env_ref expr in
       unify env_ref inferred_ret_type inferred_body_type;
 
@@ -416,12 +431,9 @@ let typecheck_binding (b : binding) (env : type_env) : type_env =
               | SimpleParam type_id -> StringMap.find type_id !env_ref
               | TypedParam (type_id, _) -> StringMap.find type_id !env_ref) params in
             List.fold_right (fun param_type acc -> FuncTy (param_type, acc)) param_types (StringMap.find id !env_ref) in
-
-      print_endline "Function type: ";
-      print_type fun_type;
-      let env_with_fun = StringMap.add id fun_type original_env in     
-      let generalized_fun_type = generalize env_with_fun fun_type in
-      let env_with_generalized_fun = StringMap.add id generalized_fun_type env_with_fun in
+ 
+      let generalized_fun_type = generalize original_env fun_type in
+      let env_with_generalized_fun = StringMap.add id generalized_fun_type original_env in
       env_with_generalized_fun
 
     | LetRecBinding (id, params_opt, ret_type_opt, expr) ->  
@@ -459,7 +471,6 @@ let typecheck_binding (b : binding) (env : type_env) : type_env =
         let env_with_fun = StringMap.add id fun_type new_env in
         env_ref := env_with_fun;
 
-        let _ = infer_type env_ref expr in
         let inferred_body_type = infer_type env_ref expr in
         unify env_ref inferred_ret_type inferred_body_type;
         
@@ -475,10 +486,11 @@ let typecheck_binding (b : binding) (env : type_env) : type_env =
 (* Main entry point *)
 let typecheck_program (p : program): unit = 
     let rec helper (env : type_env) (p : program) : unit =
-        print_endline "Environment: ";
-        print_env env;
         match p with
-        | [] -> ()
+        | [] -> print_endline "Type Environment: ";
+                print_env env;
+                print_endline "";
+                ()
         | binding :: bindings -> let new_env = typecheck_binding binding env in
                                  helper new_env bindings 
     in
